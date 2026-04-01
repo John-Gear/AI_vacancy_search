@@ -1,0 +1,11 @@
+junior/junior+ AI Product Engineer / ML Developer
+Python, FastAPI, Docker, backend
+LLM/RAG/microservices
+интересны end-to-end AI systems
+интересны ML backend / applied ML / AI product roles
+менее интересны:
+чистый analyst
+pure frontend
+pure Java enterprise
+hard research-only roles без инженерной части
+pure CV/embedded/C++ если стек совсем мимо
