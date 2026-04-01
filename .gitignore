@@ -1,5 +1,5 @@
 *venv
 .env
 jobs.db
-yandex_vacancy_search/reports/*
-!yandex_vacancy_search/reports/.gitkeep
+reports/*
+!reports/.gitkeep
