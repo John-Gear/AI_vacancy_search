@@ -23,8 +23,8 @@ OSS_UI_HTML = '''
       gap: 16px;
     }
     .card {
-      border: 1px solid #ddd;
-      border-radius: 14px;
+      border: none;
+      background: #fafafa;
       padding: 16px;
       background: #fafafa;
     }
