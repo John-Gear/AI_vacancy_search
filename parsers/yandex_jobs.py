@@ -17,6 +17,7 @@ HEADERS = {
         "Chrome/123.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Connection": "close",
 }
 
 
@@ -37,7 +38,7 @@ def strip_html(text: str) -> str:
 
 
 def fetch_json(session: requests.Session, url: str, params: dict | None = None) -> dict:
-    resp = session.get(url, headers=HEADERS, params=params, timeout=30)
+    resp = session.get(url, headers=HEADERS, params=params, timeout=(5, 20))
     resp.raise_for_status()
     return resp.json()
 
@@ -54,6 +55,7 @@ def normalize_next_url(next_url: str | None) -> str | None:
 
 
 def fetch_jobs_for_keyword(session: requests.Session, keyword: str, limit: int | None = None) -> list[dict]:
+    print('fetch_jobs_for_keyword run')
     limit = limit or MAX_RESULTS_PER_KEYWORD
     items = []
     seen = set()
@@ -65,6 +67,7 @@ def fetch_jobs_for_keyword(session: requests.Session, keyword: str, limit: int |
     }
 
     while next_url and len(items) < limit:
+        print("next_url run")
         data = fetch_json(session, next_url, params=params)
         params = None
 

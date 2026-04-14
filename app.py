@@ -16,7 +16,7 @@ load_dotenv()
 
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
 LLM_BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "10"))
-REPORT_MIN_SCORE = int(os.getenv("REPORT_MIN_SCORE", "7"))
+REPORT_MIN_SCORE = int(os.getenv("REPORT_MIN_SCORE", "9"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
@@ -33,13 +33,14 @@ DEFAULT_PROFILE_TEXT = os.getenv(
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "DEFAULT_SYSTEM_PROMPT",
     "Ты оцениваешь вакансии относительно профиля кандидата. "
-    "Твоя задача: "
+    "Твоя задача: предельно строго оценить соответствие профиля кандидата учитывая следующие пункты:"
     "1. Для каждой вакансии оценить соответствие профилю кандидата по шкале от 0 до 10. "
-    "2. Учитывать стек, тип задач, инженерную направленность, уровень позиции. "
-    "3. Если роль сильно senior/lead/head и явно выше уровня кандидата — снижай оценку. "
-    "4. Если стек и задачи совпадают, но уровень чуть выше — вакансия все еще может быть релевантной. "
-    "5. Отвечай строго JSON-массивом без пояснений вне JSON. "
-    "6. Отвечай развернуто, например так: 'Совпадает по Python, LLM и прикладному ML, но роль ближе к middle. Откликнуться стоит. Релевантно по ML backend, но мало совпадений с LLM/RAG-фокусом.' "
+    "2. 9 или 10 получают вакансии с 90% соответствием. "
+    "3. Учитывать стек, тип задач, инженерную направленность, уровень позиции. "
+    "4. Если роль сильно senior/lead/head и явно выше уровня кандидата — снижай оценку. "
+    "5. Если в вакансии есть специфический стек или специфические требования для кандидата которые не указаны в его профиле то вакансия не может быть релевантной"
+    "6. Отвечай строго JSON-массивом без пояснений вне JSON. "
+    "7. Отвечай развернуто, например так: 'По какому стеку совпадает, чего нехватает, почему рекомендуешь откликнутся' "
     'Формат ответа:[{"url": "string", "fit_score": 0, "should_apply": true, "short_comment": "краткий комментарий на русском, 1-2 предложения"}] '
 )
 DEFAULT_KEYWORDS = os.getenv("YANDEX_JOB_KEYWORDS", "ml,ds,llm,rag,data scientist,machine learning")
@@ -226,6 +227,7 @@ def analyze_yandex_jobs(
     blacklist_urls: set[str],
 ) -> dict:
     session = requests.Session()
+    session.trust_env = False
 
     all_jobs = []
     cards_seen_total = 0
@@ -247,11 +249,15 @@ def analyze_yandex_jobs(
                 continue
 
             try:
+                print(f"[VACANCY] start {card['url']}")
                 time.sleep(REQUEST_DELAY)
                 html = fetch_html(session, card["url"])
+                print(f"[VACANCY] html ok {card['url']}")
                 job = parse_vacancy_page(html, card["url"], keyword)
+                print(f"[VACANCY] parsed {job['title']}")
                 all_jobs.append(job)
             except Exception as e:
+                print(f"[VACANCY ERROR] {card['url']}: {e}")
                 fetch_errors.append(f"vacancy={card['url']}: {e}")
 
     unique_jobs = merge_jobs(all_jobs)
@@ -321,6 +327,7 @@ def oss_ui():
 
 @app.route("/api/config", methods=["GET"])
 def api_config():
+    print("api_config called")
     return jsonify({
         "default_profile_text": DEFAULT_PROFILE_TEXT,
         "default_system_prompt": DEFAULT_SYSTEM_PROMPT,
@@ -333,6 +340,7 @@ def api_config():
 
 @app.route("/api/analyze/yandex", methods=["POST"])
 def api_analyze_yandex():
+    print("api_analyze_yandex called")
     data = request.get_json(silent=True) or {}
 
     profile_text = clean_text(data.get("profile_text", ""))

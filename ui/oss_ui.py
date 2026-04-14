@@ -128,12 +128,16 @@ OSS_UI_HTML = '''
 
     function renderRecommendations(items) {
       recommendationsBox.innerHTML = "";
+
       if (!items || !items.length) {
         recommendationsBox.innerHTML = '<div class="box">Релевантных вакансий не найдено</div>';
         return;
       }
 
-      for (const item of items) {
+      const firstItems = items.slice(0, 20);
+      const hiddenItems = items.slice(20);
+
+      function createCard(item) {
         const div = document.createElement("div");
         div.className = "recommendation";
         div.innerHTML = `
@@ -147,7 +151,32 @@ OSS_UI_HTML = '''
           <div style="margin-top:8px;">${item.short_comment || ""}</div>
           <div class="muted" style="margin-top:8px;">matched_keywords: ${(item.matched_keywords || []).join(", ")}</div>
         `;
-        recommendationsBox.appendChild(div);
+        return div;
+      }
+
+      firstItems.forEach(item => recommendationsBox.appendChild(createCard(item)));
+
+      if (hiddenItems.length > 0) {
+        const toggleBtn = document.createElement("button");
+        toggleBtn.textContent = `Показать еще ${hiddenItems.length}`;
+        toggleBtn.style.marginTop = "12px";
+
+        const hiddenWrap = document.createElement("div");
+        hiddenWrap.style.display = "none";
+        hiddenWrap.style.marginTop = "12px";
+
+        hiddenItems.forEach(item => hiddenWrap.appendChild(createCard(item)));
+
+        toggleBtn.addEventListener("click", () => {
+          const isHidden = hiddenWrap.style.display === "none";
+          hiddenWrap.style.display = isHidden ? "block" : "none";
+          toggleBtn.textContent = isHidden
+            ? "Скрыть дополнительные вакансии"
+            : `Показать еще ${hiddenItems.length}`;
+        });
+
+        recommendationsBox.appendChild(toggleBtn);
+        recommendationsBox.appendChild(hiddenWrap);
       }
     }
 
@@ -196,11 +225,14 @@ OSS_UI_HTML = '''
           return;
         }
 
-        summaryBox.textContent = JSON.stringify({
-          stats: data.stats,
-          blacklist: data.blacklist,
-          errors: data.errors
-        }, null, 2);
+        const analyzed = data.stats?.unique_jobs ?? 0;
+        const ignored = (data.stats?.skipped_blacklist ?? 0) + (data.blacklist?.ignored_count ?? 0);
+        const hasErrors = ((data.errors?.fetch_errors?.length ?? 0) > 0) || ((data.errors?.llm_errors?.length ?? 0) > 0);
+
+        summaryBox.textContent =
+          `Проанализировано: ${analyzed}\n` +
+          `Проигнорировано: ${ignored}\n` +
+          `Ошибки: ${hasErrors ? "да" : "нет"}`;
 
         renderRecommendations(data.recommendations);
       } catch (e) {
