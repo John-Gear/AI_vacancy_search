@@ -1,6 +1,3 @@
 *venv
 .env
-blacklist.txt
-jobs.db
-reports/*
 !reports/.gitkeep

@@ -2,25 +2,17 @@ import os
 import re
 import json
 import time
-import sqlite3
-import hashlib
 from html import unescape
-from datetime import datetime, timezone
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from parsers.yandex_jobs import fetch_jobs_for_keyword
 from ui.oss_ui import OSS_UI_HTML
 
 load_dotenv()
-
-DATABASE_PATH = os.getenv("DATABASE_PATH", "jobs.db")
-REPORTS_DIR = os.getenv("REPORTS_DIR", "reports")
-PROFILE_PATH = os.getenv("PROFILE_PATH", "profile.txt")
-SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "system_prompt.txt")
-BLACKLIST_PATH = os.getenv("BLACKLIST_PATH", "blacklist.txt")
 
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
 LLM_BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "10"))
@@ -28,55 +20,35 @@ REPORT_MIN_SCORE = int(os.getenv("REPORT_MIN_SCORE", "7"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
-os.makedirs(REPORTS_DIR, exist_ok=True)
+DEFAULT_PROFILE_TEXT = os.getenv(
+    "DEFAULT_PROFILE_TEXT",
+    "Кандидат: AI Product Engineer / ML Developer. "
+    "Сильные стороны: Python, SQL, pandas, Numpy, Scikit-learn, CatBoost, LightGBM, TensorFlow, Docker, Git, Linux, FastAPI, Flask, RAG, LLM, Prompt Engineering, Docker Compose "
+    "Ключевые компетенции: "
+    "1. Backend & DevOps: Проектирование микросервисов (FastAPI/Flask), контейнеризация(Docker, Docker Compose), администрирование Linux-серверов. "
+    "2. Machine Learning: Полный цикл разработки моделей и их инференс (EDA, Feature Engineering, обучение CatBoost/LightGBM, валидация бизнес-метрик, упаковка в Docker и реализация API на Flask). "
+    "3. Product Mindset: Опыт руководства командой (5 человек) и запуска сложных IT-продуктов для крупных государственных и коммерческих заказчиков (Мосгортранс, Газэнергострой и др.). "
+)
+
+DEFAULT_SYSTEM_PROMPT = os.getenv(
+    "DEFAULT_SYSTEM_PROMPT",
+    "Ты оцениваешь вакансии относительно профиля кандидата. "
+    "Твоя задача: "
+    "1. Для каждой вакансии оценить соответствие профилю кандидата по шкале от 0 до 10. "
+    "2. Учитывать стек, тип задач, инженерную направленность, уровень позиции. "
+    "3. Если роль сильно senior/lead/head и явно выше уровня кандидата — снижай оценку. "
+    "4. Если стек и задачи совпадают, но уровень чуть выше — вакансия все еще может быть релевантной. "
+    "5. Отвечай строго JSON-массивом без пояснений вне JSON. "
+    "6. Отвечай развернуто, например так: 'Совпадает по Python, LLM и прикладному ML, но роль ближе к middle. Откликнуться стоит. Релевантно по ML backend, но мало совпадений с LLM/RAG-фокусом.' "
+    'Формат ответа:[{"url": "string", "fit_score": 0, "should_apply": true, "short_comment": "краткий комментарий на русском, 1-2 предложения"}] '
+)
+DEFAULT_KEYWORDS = os.getenv("YANDEX_JOB_KEYWORDS", "ml,ds,llm,rag,data scientist,machine learning")
+VACANCY_URL_PATTERN = os.getenv(
+    "VACANCY_URL_PATTERN",
+    r"^https://yandex\.ru/jobs/vacancies/[A-Za-z0-9\-]+$"
+)
 
 app = Flask(__name__)
-
-
-def get_conn():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL UNIQUE,
-        title TEXT NOT NULL,
-        keyword TEXT,
-        matched_keywords TEXT,
-        description TEXT,
-        content_hash TEXT,
-        first_seen_at TEXT,
-        last_seen_at TEXT,
-        is_processed INTEGER DEFAULT 0
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS llm_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_url TEXT NOT NULL UNIQUE,
-        fit_score INTEGER,
-        should_apply INTEGER,
-        short_comment TEXT,
-        processed_at TEXT,
-        model TEXT,
-        FOREIGN KEY(job_url) REFERENCES jobs(url)
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def clean_text(text: str) -> str:
@@ -86,30 +58,6 @@ def clean_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
-
-
-def content_hash(title: str, description: str) -> str:
-    raw = f"{title}\n{description}".encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def get_keywords() -> list[str]:
-    raw = os.getenv("YANDEX_JOB_KEYWORDS", "ml,ds,llm")
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-def read_text_file(path: str) -> str:
-    if not os.path.exists(path):
-        return ""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-def read_blacklist() -> set[str]:
-    if not os.path.exists(BLACKLIST_PATH):
-        return set()
-    with open(BLACKLIST_PATH, "r", encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
 
 
 def fetch_html(session: requests.Session, url: str) -> str:
@@ -139,8 +87,6 @@ def remove_benefits_block(text: str) -> str:
 
 
 def parse_vacancy_page(html: str, url: str, keyword: str) -> dict:
-    from bs4 import BeautifulSoup
-
     soup = BeautifulSoup(html, "html.parser")
 
     title = ""
@@ -177,175 +123,71 @@ def parse_vacancy_page(html: str, url: str, keyword: str) -> dict:
     }
 
 
-def upsert_job(job: dict) -> str:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    existing = cur.execute(
-        "SELECT * FROM jobs WHERE url = ?",
-        (job["url"],)
-    ).fetchone()
-
-    current_time = now_iso()
-
-    if existing:
-        existing_keywords = set(json.loads(existing["matched_keywords"] or "[]"))
-        new_keywords = set(job.get("matched_keywords", []))
-        merged_keywords = sorted(existing_keywords | new_keywords)
-        changed = set(merged_keywords) != existing_keywords
-
-        cur.execute("""
-            UPDATE jobs
-            SET matched_keywords = ?, last_seen_at = ?
-            WHERE url = ?
-        """, (
-            json.dumps(merged_keywords, ensure_ascii=False),
-            current_time,
-            job["url"]
-        ))
-        conn.commit()
-        conn.close()
-        return "updated" if changed else "existing"
-
-    cur.execute("""
-        INSERT INTO jobs (
-            url, title, keyword, matched_keywords, description,
-            content_hash, first_seen_at, last_seen_at, is_processed
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-    """, (
-        job["url"],
-        job["title"],
-        job["keyword"],
-        json.dumps(job.get("matched_keywords", []), ensure_ascii=False),
-        job["description"],
-        content_hash(job["title"], job["description"]),
-        current_time,
-        current_time,
-    ))
-
-    conn.commit()
-    conn.close()
-    return "inserted"
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
-def remove_jobs_not_in_search(active_urls: set[str]):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    rows = cur.execute("SELECT url FROM jobs").fetchall()
-    db_urls = {row["url"] for row in rows}
-    to_delete = db_urls - active_urls
-
-    for url in to_delete:
-        cur.execute("DELETE FROM llm_results WHERE job_url = ?", (url,))
-        cur.execute("DELETE FROM jobs WHERE url = ?", (url,))
-
-    conn.commit()
-    conn.close()
-    return len(to_delete)
+def parse_keywords(raw_keywords: str) -> list[str]:
+    return [x.strip() for x in (raw_keywords or "").split(",") if x.strip()]
 
 
-def remove_blacklisted_jobs():
-    blacklist = read_blacklist()
-    if not blacklist:
-        return 0
+def parse_blacklist(raw_blacklist: str) -> tuple[set[str], list[str]]:
+    valid = set()
+    ignored = []
 
-    conn = get_conn()
-    cur = conn.cursor()
-    removed = 0
+    for line in (raw_blacklist or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(VACANCY_URL_PATTERN, line):
+            valid.add(line)
+        else:
+            ignored.append(line)
 
-    for url in blacklist:
-        cur.execute("DELETE FROM llm_results WHERE job_url = ?", (url,))
-        deleted = cur.execute("DELETE FROM jobs WHERE url = ?", (url,)).rowcount
-        removed += deleted
-
-    conn.commit()
-    conn.close()
-    return removed
+    return valid, ignored
 
 
-def get_unprocessed_jobs(limit: int | None = None):
-    conn = get_conn()
-    sql = "SELECT * FROM jobs WHERE is_processed = 0 ORDER BY id ASC"
-    if limit is not None:
-        rows = conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
-    else:
-        rows = conn.execute(sql).fetchall()
-    conn.close()
-    return rows
+def merge_jobs(jobs: list[dict]) -> list[dict]:
+    merged = {}
+
+    for job in jobs:
+        url = job["url"]
+        if url not in merged:
+            merged[url] = {
+                "url": url,
+                "title": job["title"],
+                "description": job["description"],
+                "keyword": job["keyword"],
+                "matched_keywords": list(job.get("matched_keywords", [])),
+            }
+        else:
+            existing = set(merged[url]["matched_keywords"])
+            existing.update(job.get("matched_keywords", []))
+            merged[url]["matched_keywords"] = sorted(existing)
+
+    return list(merged.values())
 
 
-def save_llm_results(results: list[dict]):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    for item in results:
-        url = item["url"]
-        fit_score = int(item.get("fit_score", 0))
-        should_apply = 1 if item.get("should_apply", False) else 0
-        short_comment = item.get("short_comment", "").strip()
-        processed_at = now_iso()
-
-        cur.execute("""
-            INSERT OR REPLACE INTO llm_results (
-                job_url, fit_score, should_apply, short_comment, processed_at, model
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            url,
-            fit_score,
-            should_apply,
-            short_comment,
-            processed_at,
-            OPENROUTER_MODEL,
-        ))
-
-        cur.execute("""
-            UPDATE jobs
-            SET is_processed = 1
-            WHERE url = ?
-        """, (url,))
-
-    conn.commit()
-    conn.close()
-
-
-def build_llm_payload(batch_jobs) -> list[dict]:
-    jobs_for_prompt = []
-    for row in batch_jobs:
-        jobs_for_prompt.append({
-            "url": row["url"],
-            "title": row["title"],
-            "description": row["description"],
-            "matched_keywords": json.loads(row["matched_keywords"] or "[]"),
-        })
-    return jobs_for_prompt
-
-
-def call_openrouter(batch_jobs) -> list[dict]:
+def call_openrouter(batch_jobs: list[dict], profile_text: str, system_prompt_text: str) -> list[dict]:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY not set")
 
-    profile = read_text_file(PROFILE_PATH)
-    system_prompt = read_text_file(SYSTEM_PROMPT_PATH)
-    jobs_payload = build_llm_payload(batch_jobs)
-
     user_prompt = f"""
 Профиль кандидата:
-{profile}
+{profile_text}
 
 Оцени следующие вакансии.
 Верни только JSON-массив.
 
 Вакансии:
-{json.dumps(jobs_payload, ensure_ascii=False, indent=2)}
+{json.dumps(batch_jobs, ensure_ascii=False, indent=2)}
 """.strip()
 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt_text},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
@@ -377,143 +219,98 @@ def call_openrouter(batch_jobs) -> list[dict]:
     return parsed
 
 
-def run_yandex_parser() -> dict:
+def analyze_yandex_jobs(
+    keywords: list[str],
+    profile_text: str,
+    system_prompt_text: str,
+    blacklist_urls: set[str],
+) -> dict:
     session = requests.Session()
-    keywords = get_keywords()
 
-    active_urls = set()
+    all_jobs = []
     cards_seen_total = 0
-    unique_urls_seen = 0
-    new_jobs_added = 0
-    existing_jobs_seen = 0
-    updated_jobs_seen = 0
+    skipped_blacklist = 0
+    fetch_errors = []
 
     for keyword in keywords:
         try:
             cards = fetch_jobs_for_keyword(session, keyword)
         except Exception as e:
-            print(f"[ERROR] keyword={keyword}: {e}")
+            fetch_errors.append(f"keyword={keyword}: {e}")
             continue
 
         cards_seen_total += len(cards)
 
         for card in cards:
-            url = card["url"]
-            is_new_url_for_run = url not in active_urls
-            active_urls.add(url)
+            if card["url"] in blacklist_urls:
+                skipped_blacklist += 1
+                continue
 
             try:
                 time.sleep(REQUEST_DELAY)
-                html = fetch_html(session, url)
-                job = parse_vacancy_page(html, url, keyword)
-                status = upsert_job(job)
-
-                if is_new_url_for_run:
-                    unique_urls_seen += 1
-
-                if status == "inserted":
-                    new_jobs_added += 1
-                elif status == "updated":
-                    updated_jobs_seen += 1
-                else:
-                    existing_jobs_seen += 1
-
+                html = fetch_html(session, card["url"])
+                job = parse_vacancy_page(html, card["url"], keyword)
+                all_jobs.append(job)
             except Exception as e:
-                print(f"[ERROR] vacancy={url}: {e}")
+                fetch_errors.append(f"vacancy={card['url']}: {e}")
 
-    removed_closed = remove_jobs_not_in_search(active_urls)
-    removed_blacklist = remove_blacklisted_jobs()
+    unique_jobs = merge_jobs(all_jobs)
 
-    return {
-        "source": "yandex",
-        "keywords": keywords,
-        "cards_seen_total": cards_seen_total,
-        "unique_urls_seen": unique_urls_seen,
-        "new_jobs_added": new_jobs_added,
-        "existing_jobs_seen": existing_jobs_seen,
-        "updated_jobs_seen": updated_jobs_seen,
-        "removed_closed": removed_closed,
-        "removed_blacklist": removed_blacklist,
-    }
+    llm_results = []
+    llm_errors = []
 
-
-def chunked(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-def run_llm() -> dict:
-    jobs = get_unprocessed_jobs()
-    if not jobs:
-        return {"unprocessed": 0, "processed_batches": 0, "processed_jobs": 0}
-
-    processed_batches = 0
-    processed_jobs = 0
-
-    for batch in chunked(jobs, LLM_BATCH_SIZE):
+    for batch in chunked(unique_jobs, LLM_BATCH_SIZE):
         try:
-            result = call_openrouter(batch)
-            save_llm_results(result)
-            processed_batches += 1
-            processed_jobs += len(batch)
+            result = call_openrouter(batch, profile_text, system_prompt_text)
+            llm_results.extend(result)
         except Exception as e:
-            print(f"[LLM ERROR] {e}")
+            llm_errors.append(str(e))
+
+    scored_by_url = {}
+    for item in llm_results:
+        url = item.get("url")
+        if not url:
+            continue
+        scored_by_url[url] = {
+            "fit_score": int(item.get("fit_score", 0)),
+            "should_apply": bool(item.get("should_apply", False)),
+            "short_comment": clean_text(item.get("short_comment", "")),
+        }
+
+    recommendations = []
+    for job in unique_jobs:
+        score = scored_by_url.get(job["url"])
+        if not score:
+            continue
+        if score["fit_score"] < REPORT_MIN_SCORE:
+            continue
+
+        recommendations.append({
+            "title": job["title"],
+            "url": job["url"],
+            "fit_score": score["fit_score"],
+            "should_apply": score["should_apply"],
+            "short_comment": score["short_comment"],
+            "matched_keywords": job["matched_keywords"],
+        })
+
+    recommendations.sort(key=lambda x: (-x["fit_score"], x["title"]))
 
     return {
-        "unprocessed": len(jobs),
-        "processed_batches": processed_batches,
-        "processed_jobs": processed_jobs,
-    }
-
-
-def build_report() -> dict:
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT
-            j.title,
-            j.url,
-            r.fit_score,
-            r.should_apply,
-            r.short_comment
-        FROM jobs j
-        JOIN llm_results r ON j.url = r.job_url
-        ORDER BY r.fit_score DESC, j.title ASC
-    """).fetchall()
-    conn.close()
-
-    filtered = [row for row in rows if row["fit_score"] is not None and row["fit_score"] >= REPORT_MIN_SCORE]
-    report_lines = []
-
-    for idx, row in enumerate(filtered, start=1):
-        report_lines.append(
-            f"{idx}. {row['title']}\n"
-            f"URL: {row['url']}\n"
-            f"Соответствие: {row['fit_score']}/10\n"
-            f"Комментарий: {row['short_comment']}\n"
-        )
-
-    report_lines.append(f"\nВсего релевантных вакансий: {len(filtered)}")
-
-    report_text = "\n".join(report_lines).strip()
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-    report_path = os.path.join(REPORTS_DIR, f"weekly_report_{ts}.txt")
-
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_text)
-
-    return {"report_path": report_path, "count": len(filtered)}
-
-
-def get_stats():
-    conn = get_conn()
-    jobs_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    unprocessed_count = conn.execute("SELECT COUNT(*) FROM jobs WHERE is_processed = 0").fetchone()[0]
-    processed_count = conn.execute("SELECT COUNT(*) FROM llm_results").fetchone()[0]
-    conn.close()
-    return {
-        "jobs_count": jobs_count,
-        "unprocessed_count": unprocessed_count,
-        "processed_count": processed_count,
+        "keywords": keywords,
+        "stats": {
+            "cards_seen_total": cards_seen_total,
+            "jobs_after_blacklist": len(all_jobs),
+            "unique_jobs": len(unique_jobs),
+            "skipped_blacklist": skipped_blacklist,
+            "llm_processed": len(llm_results),
+            "recommendations_count": len(recommendations),
+        },
+        "errors": {
+            "fetch_errors": fetch_errors,
+            "llm_errors": llm_errors,
+        },
+        "recommendations": recommendations,
     }
 
 
@@ -522,28 +319,54 @@ def oss_ui():
     return OSS_UI_HTML
 
 
-@app.route("/api/stats", methods=["GET"])
-def api_stats():
-    return jsonify(get_stats())
+@app.route("/api/config", methods=["GET"])
+def api_config():
+    return jsonify({
+        "default_profile_text": DEFAULT_PROFILE_TEXT,
+        "default_system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "default_keywords": DEFAULT_KEYWORDS,
+        "vacancy_url_pattern": VACANCY_URL_PATTERN,
+        "report_min_score": REPORT_MIN_SCORE,
+        "llm_batch_size": LLM_BATCH_SIZE,
+    })
 
 
-@app.route("/api/parsers/yandex/run", methods=["POST"])
-def api_run_yandex_parser():
-    return jsonify(run_yandex_parser())
+@app.route("/api/analyze/yandex", methods=["POST"])
+def api_analyze_yandex():
+    data = request.get_json(silent=True) or {}
 
+    profile_text = clean_text(data.get("profile_text", ""))
+    system_prompt_text = clean_text(data.get("system_prompt_text", ""))
+    raw_keywords = data.get("keywords", DEFAULT_KEYWORDS)
+    raw_blacklist = data.get("blacklist_text", "")
 
-@app.route("/api/llm/run", methods=["POST"])
-def api_run_llm():
-    return jsonify(run_llm())
+    if not profile_text:
+        return jsonify({"error": "Поле profile_text пустое"}), 400
+    if not system_prompt_text:
+        return jsonify({"error": "Поле system_prompt_text пустое"}), 400
 
+    keywords = parse_keywords(raw_keywords)
+    if not keywords:
+        return jsonify({"error": "Поле keywords пустое"}), 400
 
-@app.route("/api/report/build", methods=["POST"])
-def api_build_report():
-    return jsonify(build_report())
+    blacklist_urls, ignored_blacklist_lines = parse_blacklist(raw_blacklist)
+
+    result = analyze_yandex_jobs(
+        keywords=keywords,
+        profile_text=profile_text,
+        system_prompt_text=system_prompt_text,
+        blacklist_urls=blacklist_urls,
+    )
+
+    result["blacklist"] = {
+        "valid_count": len(blacklist_urls),
+        "ignored_count": len(ignored_blacklist_lines),
+        "ignored_lines": ignored_blacklist_lines,
+    }
+    return jsonify(result)
 
 
 if __name__ == "__main__":
-    init_db()
     host = os.getenv("FLASK_HOST", "127.0.0.1")
     port = int(os.getenv("FLASK_PORT", "5000"))
-    app.run(host=host, port=port, debug=True)
+    app.run(host=host, port=port, debug=False, use_reloader=False)
