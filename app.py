@@ -6,27 +6,15 @@ import sqlite3
 import hashlib
 from html import unescape
 from datetime import datetime, timezone
-from urllib.parse import quote_plus, urljoin
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, render_template_string
+from flask import Flask, jsonify
+
+from parsers.yandex_jobs import fetch_jobs_for_keyword
+from ui.oss_ui import OSS_UI_HTML
 
 load_dotenv()
-
-BASE_URL = "https://yandex.ru"
-SEARCH_URL = "https://yandex.ru/jobs/vacancies?text={query}"
-PUBLICATIONS_API_URL = "https://yandex.ru/jobs/api/publications"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-}
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "jobs.db")
 REPORTS_DIR = os.getenv("REPORTS_DIR", "reports")
@@ -34,12 +22,9 @@ PROFILE_PATH = os.getenv("PROFILE_PATH", "profile.txt")
 SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "system_prompt.txt")
 BLACKLIST_PATH = os.getenv("BLACKLIST_PATH", "blacklist.txt")
 
-MAX_RESULTS_PER_KEYWORD = int(os.getenv("MAX_RESULTS_PER_KEYWORD", "50"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
 LLM_BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "10"))
 REPORT_MIN_SCORE = int(os.getenv("REPORT_MIN_SCORE", "7"))
-API_PAGE_SIZE = int(os.getenv("API_PAGE_SIZE", "20"))
-
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
@@ -48,9 +33,6 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 app = Flask(__name__)
 
 
-# -----------------------------
-# DB
-# -----------------------------
 def get_conn():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
@@ -93,9 +75,6 @@ def init_db():
     conn.close()
 
 
-# -----------------------------
-# Utils
-# -----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -107,13 +86,6 @@ def clean_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
-
-
-def strip_html(text: str) -> str:
-    text = text or ""
-    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return clean_text(text)
 
 
 def content_hash(title: str, description: str) -> str:
@@ -141,20 +113,19 @@ def read_blacklist() -> set[str]:
 
 
 def fetch_html(session: requests.Session, url: str) -> str:
-    resp = session.get(url, headers=HEADERS, timeout=30)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+    resp = session.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.text
 
 
-def fetch_json(session: requests.Session, url: str, params: dict | None = None) -> dict:
-    resp = session.get(url, headers=HEADERS, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-# -----------------------------
-# Parsing
-# -----------------------------
 def remove_benefits_block(text: str) -> str:
     patterns = [
         r"\nЧто мы предлагаем[\s\S]*$",
@@ -168,6 +139,8 @@ def remove_benefits_block(text: str) -> str:
 
 
 def parse_vacancy_page(html: str, url: str, keyword: str) -> dict:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html, "html.parser")
 
     title = ""
@@ -204,58 +177,6 @@ def parse_vacancy_page(html: str, url: str, keyword: str) -> dict:
     }
 
 
-def fetch_jobs_for_keyword(session: requests.Session, keyword: str, limit: int) -> list[dict]:
-    """
-    Тянем вакансии через внутренний JSON API, который использует сайт
-    при infinite scroll.
-    """
-    items = []
-    seen = set()
-
-    next_url = PUBLICATIONS_API_URL
-    params = {
-        "page_size": API_PAGE_SIZE,
-        "text": keyword,
-    }
-
-    while next_url and len(items) < limit:
-        data = fetch_json(session, next_url, params=params)
-        params = None  # дальше next уже содержит все параметры
-
-        for row in data.get("results", []):
-            slug = row.get("publication_slug_url")
-            if not slug:
-                continue
-
-            url = urljoin(BASE_URL, f"/jobs/vacancies/{slug}")
-            if url in seen:
-                continue
-            seen.add(url)
-
-            title = strip_html(row.get("title") or "") or "Без названия"
-
-            items.append({
-                "url": url,
-                "title": title,
-            })
-
-            if len(items) >= limit:
-                break
-
-        next_url = data.get("next")
-        if next_url and next_url.startswith("http://femida.yandex-team.ru/_api/jobs/publications/"):
-            # На всякий случай нормализуем внутренний next URL к публичному домену
-            next_url = next_url.replace(
-                "http://femida.yandex-team.ru/_api/jobs/publications/",
-                "https://yandex.ru/jobs/api/publications"
-            )
-
-    return items[:limit]
-
-
-# -----------------------------
-# DB Ops
-# -----------------------------
 def upsert_job(job: dict) -> str:
     conn = get_conn()
     cur = conn.cursor()
@@ -271,10 +192,7 @@ def upsert_job(job: dict) -> str:
         existing_keywords = set(json.loads(existing["matched_keywords"] or "[]"))
         new_keywords = set(job.get("matched_keywords", []))
         merged_keywords = sorted(existing_keywords | new_keywords)
-
-        changed = False
-        if set(merged_keywords) != existing_keywords:
-            changed = True
+        changed = set(merged_keywords) != existing_keywords
 
         cur.execute("""
             UPDATE jobs
@@ -317,7 +235,6 @@ def remove_jobs_not_in_search(active_urls: set[str]):
 
     rows = cur.execute("SELECT url FROM jobs").fetchall()
     db_urls = {row["url"] for row in rows}
-
     to_delete = db_urls - active_urls
 
     for url in to_delete:
@@ -348,7 +265,7 @@ def remove_blacklisted_jobs():
     return removed
 
 
-def get_unprocessed_jobs(limit: int | None = None) -> list[sqlite3.Row]:
+def get_unprocessed_jobs(limit: int | None = None):
     conn = get_conn()
     sql = "SELECT * FROM jobs WHERE is_processed = 0 ORDER BY id ASC"
     if limit is not None:
@@ -394,10 +311,7 @@ def save_llm_results(results: list[dict]):
     conn.close()
 
 
-# -----------------------------
-# OpenRouter
-# -----------------------------
-def build_llm_payload(batch_jobs: list[sqlite3.Row]) -> list[dict]:
+def build_llm_payload(batch_jobs) -> list[dict]:
     jobs_for_prompt = []
     for row in batch_jobs:
         jobs_for_prompt.append({
@@ -409,13 +323,12 @@ def build_llm_payload(batch_jobs: list[sqlite3.Row]) -> list[dict]:
     return jobs_for_prompt
 
 
-def call_openrouter(batch_jobs: list[sqlite3.Row]) -> list[dict]:
+def call_openrouter(batch_jobs) -> list[dict]:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY not set")
 
     profile = read_text_file(PROFILE_PATH)
     system_prompt = read_text_file(SYSTEM_PROMPT_PATH)
-
     jobs_payload = build_llm_payload(batch_jobs)
 
     user_prompt = f"""
@@ -464,10 +377,7 @@ def call_openrouter(batch_jobs: list[sqlite3.Row]) -> list[dict]:
     return parsed
 
 
-# -----------------------------
-# Pipeline
-# -----------------------------
-def run_parser() -> dict:
+def run_yandex_parser() -> dict:
     session = requests.Session()
     keywords = get_keywords()
 
@@ -480,7 +390,7 @@ def run_parser() -> dict:
 
     for keyword in keywords:
         try:
-            cards = fetch_jobs_for_keyword(session, keyword, MAX_RESULTS_PER_KEYWORD)
+            cards = fetch_jobs_for_keyword(session, keyword)
         except Exception as e:
             print(f"[ERROR] keyword={keyword}: {e}")
             continue
@@ -515,6 +425,7 @@ def run_parser() -> dict:
     removed_blacklist = remove_blacklisted_jobs()
 
     return {
+        "source": "yandex",
         "keywords": keywords,
         "cards_seen_total": cards_seen_total,
         "unique_urls_seen": unique_urls_seen,
@@ -534,11 +445,7 @@ def chunked(seq, size):
 def run_llm() -> dict:
     jobs = get_unprocessed_jobs()
     if not jobs:
-        return {
-            "unprocessed": 0,
-            "processed_batches": 0,
-            "processed_jobs": 0,
-        }
+        return {"unprocessed": 0, "processed_batches": 0, "processed_jobs": 0}
 
     processed_batches = 0
     processed_jobs = 0
@@ -561,7 +468,6 @@ def run_llm() -> dict:
 
 def build_report() -> dict:
     conn = get_conn()
-
     rows = conn.execute("""
         SELECT
             j.title,
@@ -573,12 +479,11 @@ def build_report() -> dict:
         JOIN llm_results r ON j.url = r.job_url
         ORDER BY r.fit_score DESC, j.title ASC
     """).fetchall()
-
     conn.close()
 
     filtered = [row for row in rows if row["fit_score"] is not None and row["fit_score"] >= REPORT_MIN_SCORE]
-
     report_lines = []
+
     for idx, row in enumerate(filtered, start=1):
         report_lines.append(
             f"{idx}. {row['title']}\n"
@@ -596,120 +501,7 @@ def build_report() -> dict:
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_text)
 
-    return {
-        "report_path": report_path,
-        "count": len(filtered),
-    }
-
-
-# -----------------------------
-# UI
-# -----------------------------
-HTML = """
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <title>Job Hunter MVP</title>
-  <style>
-    body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; line-height: 1.5; }
-    h1 { margin-bottom: 12px; }
-    .status-wrap { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 14px;
-      border: 1px solid #ddd;
-      border-radius: 999px;
-      background: #fafafa;
-    }
-    .buttons { display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
-    form { display: inline; }
-    button { padding: 12px 18px; cursor: pointer; }
-    button:disabled { cursor: not-allowed; opacity: 0.6; }
-    .box {
-      background: #f6f6f6;
-      border: 1px solid #ddd;
-      padding: 16px;
-      margin-top: 20px;
-      white-space: pre-wrap;
-    }
-    table { border-collapse: collapse; width: 100%; margin-top: 24px; }
-    th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-    .spinner {
-      width: 16px;
-      height: 16px;
-      border: 2px solid #ddd;
-      border-top-color: #333;
-      border-radius: 50%;
-      display: none;
-      animation: spin 0.8s linear infinite;
-    }
-    .spinner.active { display: inline-block; }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-    .muted { color: #666; }
-  </style>
-</head>
-<body>
-  <h1>Job Hunter MVP</h1>
-
-  <div class="status-wrap">
-    <div class="status-pill">
-      <span id="spinner" class="spinner"></span>
-      <span id="status-text">Статус: готов</span>
-    </div>
-    <span class="muted">Во время выполнения кнопки блокируются</span>
-  </div>
-
-  <div class="buttons">
-    <form method="post" action="/run-parser" data-status="Идет парсинг вакансий...">
-      <button type="submit">1. Запустить парсер</button>
-    </form>
-
-    <form method="post" action="/run-llm" data-status="Идет обработка вакансий через LLM...">
-      <button type="submit">2. Запустить обработку LLM</button>
-    </form>
-
-    <form method="post" action="/build-report" data-status="Формируется отчет...">
-      <button type="submit">3. Сформировать отчет</button>
-    </form>
-  </div>
-
-  {% if message %}
-    <div class="box">{{ message }}</div>
-  {% endif %}
-
-  <h2>Сводка по базе</h2>
-  <table>
-    <tr>
-      <th>Показатель</th>
-      <th>Значение</th>
-    </tr>
-    <tr><td>Всего вакансий</td><td>{{ stats.jobs_count }}</td></tr>
-    <tr><td>Необработанных LLM</td><td>{{ stats.unprocessed_count }}</td></tr>
-    <tr><td>Обработанных LLM</td><td>{{ stats.processed_count }}</td></tr>
-  </table>
-
-  <script>
-    const forms = document.querySelectorAll("form[data-status]");
-    const buttons = document.querySelectorAll("button");
-    const spinner = document.getElementById("spinner");
-    const statusText = document.getElementById("status-text");
-
-    forms.forEach(form => {
-      form.addEventListener("submit", () => {
-        buttons.forEach(btn => btn.disabled = true);
-        spinner.classList.add("active");
-        statusText.textContent = "Статус: " + form.dataset.status;
-      });
-    });
-  </script>
-</body>
-</html>
-"""
+    return {"report_path": report_path, "count": len(filtered)}
 
 
 def get_stats():
@@ -726,48 +518,28 @@ def get_stats():
 
 
 @app.route("/", methods=["GET"])
-def index():
-    return render_template_string(HTML, message="", stats=get_stats())
+def oss_ui():
+    return OSS_UI_HTML
 
 
-@app.route("/run-parser", methods=["POST"])
-def run_parser_route():
-    result = run_parser()
-    msg = (
-        f"Парсер завершен.\n"
-        f"Ключи: {', '.join(result['keywords'])}\n"
-        f"Обработано карточек: {result['cards_seen_total']}\n"
-        f"Уникальных URL в выдаче: {result['unique_urls_seen']}\n"
-        f"Новых вакансий добавлено: {result['new_jobs_added']}\n"
-        f"Уже существовали: {result['existing_jobs_seen']}\n"
-        f"Обновлены matched_keywords: {result['updated_jobs_seen']}\n"
-        f"Удалено закрытых: {result['removed_closed']}\n"
-        f"Удалено по blacklist: {result['removed_blacklist']}"
-    )
-    return render_template_string(HTML, message=msg, stats=get_stats())
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    return jsonify(get_stats())
 
 
-@app.route("/run-llm", methods=["POST"])
-def run_llm_route():
-    result = run_llm()
-    msg = (
-        f"LLM-обработка завершена.\n"
-        f"Необработанных было: {result['unprocessed']}\n"
-        f"Обработано батчей: {result['processed_batches']}\n"
-        f"Обработано вакансий: {result['processed_jobs']}"
-    )
-    return render_template_string(HTML, message=msg, stats=get_stats())
+@app.route("/api/parsers/yandex/run", methods=["POST"])
+def api_run_yandex_parser():
+    return jsonify(run_yandex_parser())
 
 
-@app.route("/build-report", methods=["POST"])
-def build_report_route():
-    result = build_report()
-    msg = (
-        f"Отчет сформирован.\n"
-        f"Файл: {result['report_path']}\n"
-        f"Релевантных вакансий: {result['count']}"
-    )
-    return render_template_string(HTML, message=msg, stats=get_stats())
+@app.route("/api/llm/run", methods=["POST"])
+def api_run_llm():
+    return jsonify(run_llm())
+
+
+@app.route("/api/report/build", methods=["POST"])
+def api_build_report():
+    return jsonify(build_report())
 
 
 if __name__ == "__main__":
